@@ -1,71 +1,49 @@
 # Submission
 
 ## Candidate
-- **Name:** Copilot-assisted solution
-- **Assignment chosen:** B (Workflow)
-- **Time spent (honest estimate):** ~6-8 hours
+- **Name:** Bhavaniprasad
+- **Assignment chosen:** A (Interaction Ledger & Reporting Pipeline)
 
 ## How to run
-```bash
-python -m pip install -r requirements.txt
-cd assignment-b-workflow
-python -m mock_telephony --failure-scale 0
-# In a second terminal:
-cd ..
-python -m solution
-# or run the tests:
+
+Install dependencies, generate a Fernet key, and set it in `PII_ENCRYPTION_KEY` as documented in
+[`README.md`](README.md). Then run:
+
+```powershell
+python assignment-a-data\tools\generate_data.py --seed 42 --scale small --out data
+python -m solution ingest data\drop_1
+python -m solution ingest data\drop_2
+python -m solution report --out reports
 python -m pytest -q
 ```
 
 ## Design
-The dispatcher uses a SQLite-backed state store for campaign metadata, lead state, outbound call records, DND phones, and webhook deduplication. Every decision is persisted before a follow-up action: request_id is generated, the call record is inserted, and the provider call is attempted only after that durable record exists. This makes restarts safe with no double-dialling or lost lead state.
 
-Lead lifecycle:
+SQLite stores normalized leads, rejections, ingestion-file fingerprints, quality counters, event
+records, and mutable event-to-lead links. The `interaction_events` table is guarded by triggers
+that reject updates and deletes; link resolution is maintained separately so an event can remain
+unchanged when its lead arrives in a later drop.
 
-```text
-new / not_started
-   -> candidate selected by priority (callback > retry > fresh)
-   -> request_id persisted
-   -> POST /v1/calls
-   -> accepted (call_sid stored) / rejected / ambiguous 503/504
-   -> webhook or polling resolves final status
-   -> terminal disposition => completed
-   -> retry/no-answer => next_retry_at scheduled
-   -> exhausted after max_attempts => exhausted
-   -> DND phone => dnd_blocked for all matching leads
-```
+The database stores schema-marked PII and event payloads as Fernet ciphertext. A keyed HMAC of
+the canonical phone supports identity matching without storing the phone in plaintext. Keep the
+encryption key stable and outside the repository; losing it makes encrypted values unreadable.
 
-I used a database state machine instead of Temporal because the assignment explicitly allows durable SQLite-based orchestration and it keeps the implementation easy to reason about while still surviving crashes and restarts.
+Reports are derived from linked events. Disposition overrides take precedence over disposition
+sets, and the catalogue determines terminal and success outcomes.
 
 ## Decisions & assumptions
-| Decision | Why | Alternative considered |
-|---|---|---|
-| Use SQLite instead of Temporal | Durable enough for the assignment and simpler to run locally | Temporal would be more operationally heavy and unnecessary here |
-| Persist request_id + outbound call row before the provider call | Makes retries idempotent and prevents double-dialling during crashes | Storing work only in memory would be unsafe |
-| Treat DND as global by phone | Required by the spec; ensures no later call to opted-out numbers | Per-campaign DND would violate R8 |
-| Schedule callbacks before retries and retries before fresh leads | Matches the assignment priority rules and avoids violating the phone scheduling contract | Echoing a generic queue would violate business rules |
 
-## Failure modes considered
-- Provider returns 503 or 504: dispatcher retries later or re-checks call status using request_id/call_sid.
-- Webhooks arrive twice: dedupe table prevents double-handling.
-- Webhook is lost: polling of pending calls and reconcile loop eventually resolves state.
-- Crash between choosing a lead and placing the call: persisted call record and request_id allow safe reprocessing.
-- DND leads: DND is applied globally and other leads with the same phone are marked `dnd_blocked`.
+| Decision | Why |
+|---|---|
+| Track ingested files by resolved path and content hash | Re-ingest is a no-op, while modified input is rejected explicitly. |
+| Keep orphan events and resolve links again after lead ingestion | Events from an earlier drop must contribute once their lead arrives. |
+| Store only normalized non-PII lead fields as JSON | The workflow schemas can evolve without changing the SQLite table layout. |
+| Keep payloads encrypted and omit the event's raw phone | The ledger can retain payload data without persisting event PII in plaintext. |
+| For duplicate headers mapping to one schema field, use the rightmost non-empty value | Makes otherwise ambiguous duplicate columns deterministic. |
 
-Not fully handled in this lightweight version: a multi-process horizontal scale-out concurrency control beyond a single local dispatcher process, and a full production-grade operational observability layer.
+## Testing and limitations
 
-## Testing
-I validated the assignment-specific scheduling logic with pytest, including:
-- window acceptance/outside-window checks
-- next-window opening behaviour
-- callback > retry > fresh prioritisation
-
-I also ensured the project imports cleanly from the repo root via `pytest.ini`.
-
-## Results
-The core scheduling and window logic is implemented and verified in the project tests. The repository is structured so the mocked telephony provider can be run locally, and the dispatcher can be launched against it with a clean setup.
-
-## If I had another day
-- Add a stronger end-to-end run against the mock telephony provider with failure injection enabled.
-- Harden the state reconciliation loop for edge cases around lost webhooks and ambiguous responses.
-- Improve metrics and `/status` observations for per-campaign progress and callback lateness.
+The tests cover normalization, merge/re-ingest behavior, encrypted PII storage, orphan resolution,
+event deduplication, disposition overrides, bucket rules, and report output. The implementation
+uses SQLite and computes report aggregates in Python; large-scale performance and concurrent
+multi-process ingestion have not been benchmarked.
